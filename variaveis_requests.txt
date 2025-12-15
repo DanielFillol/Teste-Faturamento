@@ -1,0 +1,42 @@
+API_BASE=${API_BASE:-"http://localhost:8000"}
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"material_kind","tipo_dado":"TEXT"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"pricing_model","tipo_dado":"TEXT"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"service_type","tipo_dado":"TEXT"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"units","tipo_dado":"INTEGER"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"weight","tipo_dado":"DECIMAL"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"rn_day","tipo_dado":"INTEGER"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"first_with_freight","tipo_dado":"INTEGER"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"rn_month","tipo_dado":"INTEGER"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"has_additional_month","tipo_dado":"BOOLEAN"}
+JSON
+
+curl -sS -X POST "${API_BASE}/variavel/" -H 'Content-Type: application/json' -d @- <<'JSON'
+{"nome":"charge_freight_today","tipo_dado":"BOOLEAN"}
+JSON
+
