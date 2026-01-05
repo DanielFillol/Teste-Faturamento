@@ -23,66 +23,62 @@ import (
 
 // ================= Tipos (API) =================
 
+// /regra (API)
 type RuleAPI struct {
 	ID              string            `json:"id"`
 	EstablishmentID string            `json:"establishment_id"`
+	TipoRegra       string            `json:"tipo_regra"`
 	Condicao        string            `json:"condicao"`
 	Formula         string            `json:"formula"`
 	Prioridade      int               `json:"prioridade"`
 	Variaveis       map[string]string `json:"variaveis"`
 }
 
+// /variavel (API)
 type VariableAPI struct {
 	ID       string `json:"id"`
 	Nome     string `json:"nome"`
 	TipoDado string `json:"tipo_dado"`
 }
 
-type CompleteSimReq struct {
-	Contexto map[string]any `json:"contexto"`
+// /transacao/registrar_evento (API)
+type EventoRequest struct {
+	Cenario map[string]any `json:"cenario"`
 }
 
 type SimulateResponse struct {
-	EstablishmentID  string        `json:"establishment_id"`
-	EventoExternalID string        `json:"evento_external_id"`
-	Valor            float64       `json:"valor"`
-	Audit            []AuditResult `json:"audit"`
+	ID              string        `json:"id"`
+	EstablishmentID string        `json:"establishment_id"`
+	TipoEvento      string        `json:"tipo_evento"`
+	EventoExternoID string        `json:"evento_externo_id"`
+	Valor           float64       `json:"valor"`
+	Audit           []AuditResult `json:"audit"`
+	CriadaEm        string        `json:"criada_em"`
 }
 
 type AuditResult struct {
-	RefRegra struct {
-		Condicao string `json:"condicao"`
-		Formula  string `json:"formula"`
-		ID       string `json:"id"`
-	} `json:"ref_regra"`
-	AvaliacaoFormula *struct {
-		Sucesso   bool     `json:"sucesso"`
-		Resultado *float64 `json:"resultado"`
-	} `json:"avaliacao_formula"`
-	AvaliacaoCondicao struct {
-		Sucesso   bool `json:"sucesso"`
-		Resultado bool `json:"resultado"`
-		Mensagem  any  `json:"mensagem"`
-	} `json:"avaliacao_condicao"`
-	Contexto map[string]any `json:"contexto"`
+	RegraID        *string  `json:"regra_id"`
+	Prioridade     *int     `json:"prioridade"`
+	Condicao       *string  `json:"condicao"`
+	Formula        *string  `json:"formula"`
+	PassouCondicao bool     `json:"passou_condicao"`
+	ValorCalculado *float64 `json:"valor_calculado"`
+	Erro           *string  `json:"erro"`
 }
 
+// Erros padronizados pela API (FastAPI handlers costumam devolver {"detail": "..."}).
 type APIError struct {
-	Error             string        `json:"error"`
-	Detail            string        `json:"detail"`
-	EstablishmentID   string        `json:"establishment_id"`
-	EventoExternalID  string        `json:"evento_external_id"`
-	Audit             []AuditResult `json:"audit"`
-	AvaliacaoSemValor bool          `json:"-"`
-	HTTPStatus        int           `json:"-"`
-	RawBody           string        `json:"-"`
+	Error      string `json:"error"`
+	Detail     string `json:"detail"`
+	HTTPStatus int    `json:"-"`
+	RawBody    string `json:"-"`
 }
 
 // ================= Regras (CSV) =================
 
 type RuleKey struct {
 	Estab        string
-	Material     string // material_kind_normalizado (ou material_kind); "" = coringa (qualquer material)
+	Material     string
 	ServiceType  string
 	PricingModel string
 }
@@ -301,6 +297,8 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: tr}
 }
 
+// doJSON agora só falha por erro de transporte (DNS, timeout, etc).
+// Erro HTTP 4xx/5xx volta via status e body.
 func doJSON(client *http.Client, method, url string, body any, out any, retries int, sem chan struct{}) (int, []byte, error) {
 	var bodyBytes []byte
 	var err error
@@ -339,79 +337,118 @@ func doJSON(client *http.Client, method, url string, body any, out any, retries 
 
 		respBody, _ := io.ReadAll(resp.Body)
 
+		// retry em 5xx/429
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
 			if r < retries {
 				time.Sleep(time.Duration(r+1) * 2 * time.Second)
 				continue
 			}
-			return resp.StatusCode, respBody, fmt.Errorf("http status %d for %s", resp.StatusCode, url)
-		}
-		if resp.StatusCode >= 400 {
-			return resp.StatusCode, respBody, errors.New(string(respBody))
+			// sem erro de transporte, mas sem retries restantes
+			return resp.StatusCode, respBody, nil
 		}
 
-		if out != nil {
-			if err := json.Unmarshal(respBody, out); err != nil {
-				return resp.StatusCode, respBody, nil
-			}
+		// 2xx: tenta unmarshal
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && out != nil {
+			_ = json.Unmarshal(respBody, out) // se falhar, caller ainda tem respBody
 		}
 		return resp.StatusCode, respBody, nil
 	}
 	return 0, nil, errors.New("max retries reached")
 }
 
-func listVariables(client *http.Client, apiBase string, retries int, sem chan struct{}) ([]VariableAPI, error) {
+func parseAPIError(status int, raw []byte) *APIError {
+	apiErr := &APIError{HTTPStatus: status, RawBody: string(raw)}
+	_ = json.Unmarshal(raw, apiErr)
+	if apiErr.Detail == "" && apiErr.Error == "" {
+		apiErr.Detail = strings.TrimSpace(string(raw))
+	}
+	return apiErr
+}
+
+// ===== Variáveis =====
+
+func listVariables(client *http.Client, apiBase string, retries int, sem chan struct{}) ([]VariableAPI, *APIError, error) {
 	url := strings.TrimRight(apiBase, "/") + "/variavel/"
 	var out []VariableAPI
-	_, _, err := doJSON(client, "GET", url, nil, &out, retries, sem)
-	return out, err
+	status, raw, err := doJSON(client, "GET", url, nil, &out, retries, sem)
+	if err != nil {
+		return nil, nil, err
+	}
+	if status >= 400 {
+		return nil, parseAPIError(status, raw), nil
+	}
+	return out, nil, nil
 }
 
-func createVariable(client *http.Client, apiBase, nome, tipo string, retries int, sem chan struct{}) error {
+func createVariable(client *http.Client, apiBase, nome, tipo string, retries int, sem chan struct{}) *APIError {
 	url := strings.TrimRight(apiBase, "/") + "/variavel/"
 	body := map[string]any{"nome": nome, "tipo_dado": tipo}
-	_, _, err := doJSON(client, "POST", url, body, nil, retries, sem)
-	if err != nil && strings.Contains(err.Error(), "409") {
-		return nil
+	status, raw, err := doJSON(client, "POST", url, body, nil, retries, sem)
+	if err != nil {
+		return &APIError{Detail: err.Error(), HTTPStatus: 0}
 	}
-	return err
+	if status >= 400 {
+		return parseAPIError(status, raw)
+	}
+	return nil
 }
 
-func listRulesByEstab(client *http.Client, apiBase, estab string, retries int, sem chan struct{}) ([]RuleAPI, error) {
-	url := strings.TrimRight(apiBase, "/") + fmt.Sprintf("/regra/estabelecimento/%s", estab)
+// ===== Regras =====
+
+func listRulesByEstab(client *http.Client, apiBase, estab string, tipoRegra string, retries int, sem chan struct{}) ([]RuleAPI, *APIError, error) {
+	// GET /regra/estabelecimento/{establishment_id}?tipo_regra=EVENTO (opcional)
+	base := strings.TrimRight(apiBase, "/") + fmt.Sprintf("/regra/estabelecimento/%s", estab)
+	url := base
+	if strings.TrimSpace(tipoRegra) != "" {
+		url = url + "?tipo_regra=" + tipoRegra
+	}
+
 	var out []RuleAPI
-	_, _, err := doJSON(client, "GET", url, nil, &out, retries, sem)
-	return out, err
+	status, raw, err := doJSON(client, "GET", url, nil, &out, retries, sem)
+	if err != nil {
+		return nil, nil, err
+	}
+	if status >= 400 {
+		return nil, parseAPIError(status, raw), nil
+	}
+	return out, nil, nil
 }
 
-func createRule(client *http.Client, apiBase string, estab string, cond string, formula string, prio int, retries int, sem chan struct{}) error {
+func createRule(client *http.Client, apiBase string, estab string, tipoRegra string, cond string, formula string, prio int, retries int, sem chan struct{}) *APIError {
 	url := strings.TrimRight(apiBase, "/") + "/regra/"
 	body := map[string]any{
 		"establishment_id": estab,
+		"tipo_regra":       tipoRegra,
 		"condicao":         cond,
 		"formula":          formula,
 		"prioridade":       prio,
 	}
-	_, _, err := doJSON(client, "POST", url, body, nil, retries, sem)
-	return err
+	status, raw, err := doJSON(client, "POST", url, body, nil, retries, sem)
+	if err != nil {
+		return &APIError{Detail: err.Error(), HTTPStatus: 0}
+	}
+	if status >= 400 {
+		return parseAPIError(status, raw)
+	}
+	return nil
 }
 
-func simulate(client *http.Client, apiBase string, ctx map[string]any, retries int, sem chan struct{}) (*SimulateResponse, *APIError) {
-	url := strings.TrimRight(apiBase, "/") + "/faturamento/simular"
-	reqBody := CompleteSimReq{Contexto: ctx}
+// ===== Transação (registrar_evento) =====
+
+func registrarEvento(client *http.Client, apiBase string, cenario map[string]any, retries int, sem chan struct{}) (*SimulateResponse, *APIError) {
+	// POST /transacao/registrar_evento  body: {"cenario": {...}}
+	url := strings.TrimRight(apiBase, "/") + "/transacao/registrar_evento"
+	reqBody := EventoRequest{Cenario: cenario}
 
 	var ok SimulateResponse
 	status, raw, err := doJSON(client, "POST", url, reqBody, &ok, retries, sem)
-	if err == nil {
-		return &ok, nil
+	if err != nil {
+		return nil, &APIError{Detail: err.Error(), HTTPStatus: 0}
 	}
-
-	apiErr := &APIError{HTTPStatus: status, RawBody: string(raw)}
-	_ = json.Unmarshal(raw, apiErr)
-	if apiErr.Error == "" && apiErr.Detail == "" {
-		apiErr.Detail = strings.TrimSpace(string(raw))
+	if status >= 400 {
+		return nil, parseAPIError(status, raw)
 	}
-	return nil, apiErr
+	return &ok, nil
 }
 
 // ================= Bootstrap: Variáveis + Dump =================
@@ -431,6 +468,9 @@ func ensureVariables(client *http.Client, apiBase string, retries int, sem chan 
 		{"rn_month", "INTEGER"},
 		{"has_additional_month", "BOOLEAN"},
 		{"charge_freight_today", "BOOLEAN"},
+		// novos obrigatórios do faturamento:
+		{"evento_id", "TEXT"},
+		{"tipo_evento", "TEXT"},
 	}
 
 	// dump (sempre: lista desejada)
@@ -449,10 +489,14 @@ func ensureVariables(client *http.Client, apiBase string, retries int, sem chan 
 		_ = os.WriteFile(dumpPath, []byte(b.String()), 0o644)
 	}
 
-	vars, err := listVariables(client, apiBase, retries, sem)
+	vars, apiErr, err := listVariables(client, apiBase, retries, sem)
 	if err != nil {
 		return err
 	}
+	if apiErr != nil {
+		return fmt.Errorf("listVariables: status %d: %s", apiErr.HTTPStatus, apiErr.Detail)
+	}
+
 	exists := map[string]bool{}
 	for _, v := range vars {
 		exists[strings.ToLower(v.Nome)] = true
@@ -461,11 +505,24 @@ func ensureVariables(client *http.Client, apiBase string, retries int, sem chan 
 		if exists[strings.ToLower(d.Nome)] {
 			continue
 		}
-		if err := createVariable(client, apiBase, d.Nome, d.Tipo, retries, sem); err != nil {
-			return err
+		if e := createVariable(client, apiBase, d.Nome, d.Tipo, retries, sem); e != nil {
+			// 409 = já existe, segue o jogo
+			if e.HTTPStatus == 409 {
+				continue
+			}
+			return fmt.Errorf("createVariable %s: status %d: %s", d.Nome, e.HTTPStatus, firstNonEmpty(e.Detail, e.Error, e.RawBody))
 		}
 	}
 	return nil
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // ================= Parser Regras =================
@@ -478,8 +535,7 @@ type RuleSources struct {
 }
 
 func readRulesPricingCSV(path string) (*RuleSources, error) {
-	comma, header, rows, err := readCSV(path)
-	_ = comma
+	_, header, rows, err := readCSV(path)
 	if err != nil {
 		return nil, err
 	}
@@ -545,7 +601,6 @@ func readRulesPricingCSV(path string) (*RuleSources, error) {
 		// se material vazio e existir frete: guarda também como "coringa" por (estab, service_type, pricing_model)
 		if mat == "" && frete > 0 {
 			genFrete[RuleKey{Estab: eid, Material: "", ServiceType: svc, PricingModel: pm}] = frete
-			// NÃO dá continue: também precisamos criar PricingSpec coringa para registrar regra na API
 		}
 
 		key := RuleKey{Estab: eid, Material: mat, ServiceType: svc, PricingModel: pm}
@@ -608,7 +663,6 @@ func buildFormula(spec PricingSpec, monthly MonthlySpec, genericFrete map[RuleKe
 	var base string
 	switch spec.Key.PricingModel {
 	case "GROUPS_COLLECT_FEE", "GROUPS":
-		// groups não tem componente por units/weight; normalmente é só frete (e raramente min_collect_fee)
 		base = "0"
 	default:
 		if isUnitsFamily(spec.Key.PricingModel) {
@@ -622,12 +676,10 @@ func buildFormula(spec PricingSpec, monthly MonthlySpec, genericFrete map[RuleKe
 
 	parts := []string{base}
 
-	// min_collect_fee é aditivo
 	if spec.MinCollectFee > 0 {
 		parts = append(parts, fmt.Sprintf("(%s)", f6(spec.MinCollectFee)))
 	}
 
-	// min_quantity_price como “complemento até o mínimo”
 	if spec.MinQty > 0 {
 		min := f6(spec.MinQty)
 		if isUnitsFamily(spec.Key.PricingModel) {
@@ -641,7 +693,6 @@ func buildFormula(spec PricingSpec, monthly MonthlySpec, genericFrete map[RuleKe
 		}
 	}
 
-	// frete: respeita material específico; senão usa frete coringa (material vazio)
 	frete := spec.FreightFee
 	if frete <= 0 {
 		if g, ok := genericFrete[RuleKey{Estab: spec.Key.Estab, Material: "", ServiceType: spec.Key.ServiceType, PricingModel: spec.Key.PricingModel}]; ok {
@@ -654,7 +705,6 @@ func buildFormula(spec PricingSpec, monthly MonthlySpec, genericFrete map[RuleKe
 		)
 	}
 
-	// mensalidade: 1x no mês (rn_month==1); se mensalidade “additional”, só cobra se has_additional_month
 	if monthly.Has && monthly.Fee > 0 {
 		isAdd := "False"
 		if monthly.IsAdditional {
@@ -669,7 +719,6 @@ func buildFormula(spec PricingSpec, monthly MonthlySpec, genericFrete map[RuleKe
 }
 
 func buildCondition(spec PricingSpec) string {
-	// match exato; se material == "" => regra coringa (qualquer material) mas ainda exige pricing_model + service_type
 	if spec.Key.Material == "" {
 		return fmt.Sprintf("pricing_model == '%s' and service_type == '%s'",
 			spec.Key.PricingModel, spec.Key.ServiceType)
@@ -679,10 +728,11 @@ func buildCondition(spec PricingSpec) string {
 }
 
 type ruleReq struct {
-	Estab   string
-	Cond    string
-	Formula string
-	Prio    int
+	Estab     string
+	TipoRegra string
+	Cond      string
+	Formula   string
+	Prio      int
 }
 
 func dumpRulesRequests(apiBase, path string, reqs []ruleReq) {
@@ -696,6 +746,7 @@ func dumpRulesRequests(apiBase, path string, reqs []ruleReq) {
 	for _, rr := range reqs {
 		payload := map[string]any{
 			"establishment_id": rr.Estab,
+			"tipo_regra":       rr.TipoRegra,
 			"condicao":         rr.Cond,
 			"formula":          rr.Formula,
 			"prioridade":       rr.Prio,
@@ -708,7 +759,7 @@ func dumpRulesRequests(apiBase, path string, reqs []ruleReq) {
 	_ = os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-func ensureRules(client *http.Client, apiBase string, rules *RuleSources, prioBase int, retries int, sem chan struct{}, dumpPath string) error {
+func ensureRules(client *http.Client, apiBase string, rules *RuleSources, prioBase int, tipoRegra string, retries int, sem chan struct{}, dumpPath string) error {
 	byEstab := map[string][]PricingSpec{}
 	for _, spec := range rules.Pricings {
 		byEstab[spec.Key.Estab] = append(byEstab[spec.Key.Estab], spec)
@@ -722,10 +773,14 @@ func ensureRules(client *http.Client, apiBase string, rules *RuleSources, prioBa
 	allDesiredForDump := make([]ruleReq, 0, 20000)
 
 	for eid, specs := range byEstab {
-		existing, err := listRulesByEstab(client, apiBase, eid, retries, sem)
+		existing, apiErr, err := listRulesByEstab(client, apiBase, eid, tipoRegra, retries, sem)
 		if err != nil {
 			return fmt.Errorf("listRules estab %s: %w", eid, err)
 		}
+		if apiErr != nil {
+			return fmt.Errorf("listRules estab %s: status %d: %s", eid, apiErr.HTTPStatus, apiErr.Detail)
+		}
+
 		existsSig := map[string]bool{}
 		for _, r := range existing {
 			existsSig[r.Condicao+"||"+r.Formula] = true
@@ -739,16 +794,13 @@ func ensureRules(client *http.Client, apiBase string, rules *RuleSources, prioBa
 			if a.Key.PricingModel != b.Key.PricingModel {
 				return a.Key.PricingModel < b.Key.PricingModel
 			}
-			// IMPORTANT: material "" vem antes => prioridade menor => perde para material específico (prioridade maior)
 			return a.Key.Material < b.Key.Material
 		})
 
 		monthly := rules.MonthlyByEID[eid]
 		nextPrio := prioBase
 
-		// (Opcional, mas útil): regra "fallback mensal" que casa sempre,
-		// para casos onde a 1ª coleta do mês não casa com nenhuma trinca, mas existe mensalidade.
-		// Prioridade menor que as outras: não deve ganhar quando houver regra específica.
+		// fallback mensal (cond True)
 		if monthly.Has && monthly.Fee > 0 {
 			isAdd := "False"
 			if monthly.IsAdditional {
@@ -762,12 +814,15 @@ func ensureRules(client *http.Client, apiBase string, rules *RuleSources, prioBa
 				fallbackPrio = 1
 			}
 
-			allDesiredForDump = append(allDesiredForDump, ruleReq{Estab: eid, Cond: cond, Formula: form, Prio: fallbackPrio})
+			allDesiredForDump = append(allDesiredForDump, ruleReq{Estab: eid, TipoRegra: tipoRegra, Cond: cond, Formula: form, Prio: fallbackPrio})
 
 			sig := cond + "||" + form
 			if !existsSig[sig] {
-				if err := createRule(client, apiBase, eid, cond, form, fallbackPrio, retries, sem); err != nil {
-					return fmt.Errorf("create fallback monthly rule estab %s: %w", eid, err)
+				if e := createRule(client, apiBase, eid, tipoRegra, cond, form, fallbackPrio, retries, sem); e != nil {
+					// 409 = já existe, segue
+					if e.HTTPStatus != 409 {
+						return fmt.Errorf("create fallback monthly rule estab %s: status %d: %s", eid, e.HTTPStatus, firstNonEmpty(e.Detail, e.Error, e.RawBody))
+					}
 				}
 				existsSig[sig] = true
 			}
@@ -778,21 +833,22 @@ func ensureRules(client *http.Client, apiBase string, rules *RuleSources, prioBa
 			form := buildFormula(spec, monthly, rules.GenericFrete)
 			sig := cond + "||" + form
 
-			allDesiredForDump = append(allDesiredForDump, ruleReq{Estab: eid, Cond: cond, Formula: form, Prio: nextPrio})
+			allDesiredForDump = append(allDesiredForDump, ruleReq{Estab: eid, TipoRegra: tipoRegra, Cond: cond, Formula: form, Prio: nextPrio})
 
 			if existsSig[sig] {
 				nextPrio++
 				continue
 			}
-			if err := createRule(client, apiBase, eid, cond, form, nextPrio, retries, sem); err != nil {
-				return fmt.Errorf("create rule estab %s (%s): %w", eid, cond, err)
+			if e := createRule(client, apiBase, eid, tipoRegra, cond, form, nextPrio, retries, sem); e != nil {
+				if e.HTTPStatus != 409 {
+					return fmt.Errorf("create rule estab %s (%s): status %d: %s", eid, cond, e.HTTPStatus, firstNonEmpty(e.Detail, e.Error, e.RawBody))
+				}
 			}
 			existsSig[sig] = true
 			nextPrio++
 		}
 	}
 
-	// dump das requisições "necessárias"
 	if dumpPath != "" {
 		dumpRulesRequests(apiBase, dumpPath, allDesiredForDump)
 	}
@@ -800,7 +856,7 @@ func ensureRules(client *http.Client, apiBase string, rules *RuleSources, prioBa
 	return nil
 }
 
-// ================= Preprocess coletas -> contexto (sem calcular faturamento) =================
+// ================= Preprocess coletas -> contexto =================
 
 type RowCtx struct {
 	estab  string
@@ -850,11 +906,9 @@ func buildRowContexts(rows [][]string, h map[string]int, rules *RuleSources) []R
 		if spec, ok := rules.Pricings[key]; ok && spec.FreightFee > 0 {
 			return spec.FreightFee
 		}
-		// coringa material vazio
 		if g, ok := rules.GenericFrete[RuleKey{Estab: eid, Material: "", ServiceType: st, PricingModel: pm}]; ok {
 			return g
 		}
-		// também pode existir PricingSpec coringa (Material == "")
 		if spec, ok := rules.Pricings[RuleKey{Estab: eid, Material: "", ServiceType: st, PricingModel: pm}]; ok && spec.FreightFee > 0 {
 			return spec.FreightFee
 		}
@@ -919,16 +973,115 @@ func buildRowContexts(rows [][]string, h map[string]int, rules *RuleSources) []R
 	return out
 }
 
+func buildDesiredRuleReqs(rules *RuleSources, prioBase int, tipoRegra string) []ruleReq {
+	byEstab := map[string][]PricingSpec{}
+	for _, spec := range rules.Pricings {
+		byEstab[spec.Key.Estab] = append(byEstab[spec.Key.Estab], spec)
+	}
+	for eid := range rules.MonthlyByEID {
+		if _, ok := byEstab[eid]; !ok {
+			byEstab[eid] = nil
+		}
+	}
+
+	reqs := make([]ruleReq, 0, 20000)
+
+	for eid, specs := range byEstab {
+		sort.Slice(specs, func(i, j int) bool {
+			a, b := specs[i], specs[j]
+			if a.Key.ServiceType != b.Key.ServiceType {
+				return a.Key.ServiceType < b.Key.ServiceType
+			}
+			if a.Key.PricingModel != b.Key.PricingModel {
+				return a.Key.PricingModel < b.Key.PricingModel
+			}
+			return a.Key.Material < b.Key.Material
+		})
+
+		monthly := rules.MonthlyByEID[eid]
+		nextPrio := prioBase
+
+		// fallback mensal (cond True)
+		if monthly.Has && monthly.Fee > 0 {
+			isAdd := "False"
+			if monthly.IsAdditional {
+				isAdd = "True"
+			}
+			cond := "True"
+			form := fmt.Sprintf(
+				"((%.6f) if (rn_month == 1 and ((not %s) or has_additional_month)) else 0)",
+				monthly.Fee, isAdd,
+			)
+
+			fallbackPrio := prioBase - 1
+			if fallbackPrio < 1 {
+				fallbackPrio = 1
+			}
+			reqs = append(reqs, ruleReq{Estab: eid, TipoRegra: tipoRegra, Cond: cond, Formula: form, Prio: fallbackPrio})
+		}
+
+		for _, spec := range specs {
+			cond := buildCondition(spec)
+			form := buildFormula(spec, monthly, rules.GenericFrete)
+			reqs = append(reqs, ruleReq{Estab: eid, TipoRegra: tipoRegra, Cond: cond, Formula: form, Prio: nextPrio})
+			nextPrio++
+		}
+	}
+
+	return reqs
+}
+
+func dumpVariablesRequests(apiBase, dumpPath string) {
+	if dumpPath == "" {
+		return
+	}
+
+	desired := []struct {
+		Nome string
+		Tipo string
+	}{
+		{"material_kind", "TEXT"},
+		{"pricing_model", "TEXT"},
+		{"service_type", "TEXT"},
+		{"units", "INTEGER"},
+		{"weight", "DECIMAL"},
+		{"rn_day", "INTEGER"},
+		{"first_with_freight", "INTEGER"},
+		{"rn_month", "INTEGER"},
+		{"has_additional_month", "BOOLEAN"},
+		{"charge_freight_today", "BOOLEAN"},
+		{"evento_id", "TEXT"},
+		{"tipo_evento", "TEXT"},
+	}
+
+	var b strings.Builder
+	b.WriteString(`API_BASE=${API_BASE:-"`)
+	b.WriteString(strings.TrimRight(apiBase, "/"))
+	b.WriteString(`"}` + "\n\n")
+
+	for _, d := range desired {
+		payload := map[string]any{"nome": d.Nome, "tipo_dado": d.Tipo}
+		j, _ := json.Marshal(payload)
+		b.WriteString("curl -sS -X POST \"${API_BASE}/variavel/\" -H 'Content-Type: application/json' -d @- <<'JSON'\n")
+		b.WriteString(string(j))
+		b.WriteString("\nJSON\n\n")
+	}
+
+	_ = os.WriteFile(dumpPath, []byte(b.String()), 0o644)
+}
+
 // ================= Exec por linha =================
 
-func processRow(client *http.Client, apiBase string, row []string, h map[string]int, ctx RowCtx, retries int, sem chan struct{}) ([]string, *APIError) {
+func processRow(client *http.Client, apiBase string, row []string, h map[string]int, ctx RowCtx, tipoEvento string, retries int, sem chan struct{}) ([]string, *APIError) {
 	eid := ctx.estab
 	if eid == "" {
 		return nil, &APIError{Detail: "sem establishment_external_id", HTTPStatus: 0}
 	}
 
 	hauler := strings.TrimSpace(get(row, h, "hauler_name"))
-	evento := fmt.Sprintf("%s|%s|%s|%s|%s|%s|rd%d|rm%d",
+
+	// evento_id (obrigatório pela API)
+	eventoID := fmt.Sprintf("%s|%s|%s|%s|%s|%s|rd%d|rm%d",
 		ctx.day, eid, hauler, ctx.mk, ctx.st, ctx.pm, ctx.rnDay, ctx.rnMonth,
 	)
 
@@ -937,9 +1090,11 @@ func processRow(client *http.Client, apiBase string, row []string, h map[string]
 		chargeToday = true
 	}
 
-	reqCtx := map[string]any{
+	// cenario agora precisa conter: establishment_id, evento_id, tipo_evento
+	reqCenario := map[string]any{
 		"establishment_id":     eid,
-		"evento_external_id":   evento,
+		"evento_id":            eventoID,
+		"tipo_evento":          tipoEvento,
 		"material_kind":        ctx.mk,
 		"pricing_model":        ctx.pm,
 		"service_type":         ctx.st,
@@ -952,7 +1107,7 @@ func processRow(client *http.Client, apiBase string, row []string, h map[string]
 		"charge_freight_today": chargeToday,
 	}
 
-	ok, apiErr := simulate(client, apiBase, reqCtx, retries, sem)
+	ok, apiErr := registrarEvento(client, apiBase, reqCenario, retries, sem)
 	valFinal := 0.0
 	if ok != nil {
 		valFinal = ok.Valor
@@ -999,13 +1154,20 @@ func processRow(client *http.Client, apiBase string, row []string, h map[string]
 
 func main() {
 	apiBase := flag.String("api", "http://127.0.0.1:8000", "Base URL da API")
-	rulesPath := flag.String("rules", "", "CSV de regras (regras_pricing.csv)")
-	coletasPath := flag.String("coletas", "", "CSV de coletas/entrada (entrada.csv)")
+	rulesPath := flag.String("rules", "regras_pricing.csv", "CSV de regras (regras_pricing.csv)")
+	coletasPath := flag.String("coletas", "entrada.csv", "CSV de coletas/entrada (entrada.csv)")
 	outPath := flag.String("out", "saida.csv", "CSV de saída")
 
 	bootstrap := flag.Bool("bootstrap", false, "Cria variáveis e regras (idempotente por condicao+formula)")
 	prioBase := flag.Int("prio-base", 50000, "Prioridade base para regras geradas")
-	workers := flag.Int("workers", max(4, runtime.NumCPU()), "Workers (paralelismo por linha)")
+
+	// NOVO: tipo_regra das regras criadas na API (obrigatório em RegraRequest)
+	tipoRegra := flag.String("tipo-regra", "EVENTO", "Tipo de regra para criação/listagem (ex.: EVENTO)")
+
+	// NOVO: tipo_evento do cenário (obrigatório no registrar_evento)
+	tipoEvento := flag.String("tipo-evento", "COLETA", "Tipo do evento enviado ao faturamento (ex.: COLETA)")
+
+	workers := flag.Int("workers", max(40, runtime.NumCPU()), "Workers (paralelismo por linha)")
 	maxInflight := flag.Int("max-inflight", 200, "Máximo de requisições HTTP simultâneas (global)")
 	retries := flag.Int("retries", 2, "Retries por requisição em 429/5xx")
 	timeout := flag.Duration("timeout", 25*time.Second, "Timeout por requisição HTTP")
@@ -1047,7 +1209,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "erro garantindo variáveis:", err)
 			os.Exit(1)
 		}
-		if err := ensureRules(client, *apiBase, rules, *prioBase, *retries, sem, ruleDump); err != nil {
+		if err := ensureRules(client, *apiBase, rules, *prioBase, strings.TrimSpace(*tipoRegra), *retries, sem, ruleDump); err != nil {
 			fmt.Fprintln(os.Stderr, "erro no bootstrap de regras:", err)
 			os.Exit(1)
 		}
@@ -1094,19 +1256,28 @@ func main() {
 	jobs := make(chan Job, *workers*2)
 	results := make(chan Result, *workers*2)
 
+	// ================= Dumps SEMPRE (antes de qualquer processamento) =================
+	if strings.TrimSpace(*dumpVars) != "" {
+		dumpVariablesRequests(*apiBase, *dumpVars)
+		fmt.Fprintln(os.Stderr, "Dump variáveis gerado:", *dumpVars)
+	}
+
+	if strings.TrimSpace(*dumpRules) != "" {
+		reqs := buildDesiredRuleReqs(rules, *prioBase, strings.TrimSpace(*tipoRegra))
+		dumpRulesRequests(*apiBase, *dumpRules, reqs)
+		fmt.Fprintln(os.Stderr, "Dump regras gerado:", *dumpRules, " (total:", len(reqs), ")")
+	}
+
 	var wg sync.WaitGroup
 	for w := 0; w < *workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				out, apiErr := processRow(client, *apiBase, job.Row, h, rowCtxs[job.Idx], *retries, sem)
+				out, apiErr := processRow(client, *apiBase, job.Row, h, rowCtxs[job.Idx], strings.TrimSpace(*tipoEvento), *retries, sem)
 				var err error
 				if apiErr != nil {
-					msg := apiErr.Error
-					if msg == "" {
-						msg = apiErr.Detail
-					}
+					msg := firstNonEmpty(apiErr.Detail, apiErr.Error, apiErr.RawBody)
 					if msg == "" {
 						msg = "erro API"
 					}
@@ -1156,6 +1327,8 @@ func main() {
 			s := res.Err.Error()
 			if strings.Contains(s, "status 404") {
 				errAgg["status 404"]++
+			} else if strings.Contains(s, "status 409") {
+				errAgg["status 409"]++
 			} else if strings.Contains(s, "status 422") {
 				errAgg["status 422"]++
 			} else {
